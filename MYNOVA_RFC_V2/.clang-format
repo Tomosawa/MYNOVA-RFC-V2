@@ -1,0 +1,12 @@
+# MYNOVA RFC V2 — clang-format 基准配置
+# 以现有代码风格为基准生成, 不强制列宽(ColumnLimit:0)避免大面积重排;
+# 新代码统一执行: 4空格缩进、指针右贴、大括号同行。
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 0
+PointerAlignment: Right
+DerivePointerAlignment: false
+SortIncludes: false
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: Inline
+KeepEmptyLinesAtTheStartOfBlocks: false

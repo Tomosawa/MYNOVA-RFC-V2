@@ -1,0 +1,150 @@
+name: Build and release ESP32-S3 firmware
+
+on:
+  push:
+    tags:
+      - '**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: firmware-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ESP32_CORE_VERSION: '3.3.5'
+  # N8R2: 8 MiB flash, 2 MiB Quad SPI PSRAM (PSRAM=enabled, not opi).
+  FQBN: esp32:esp32:esp32s3:FlashSize=8M,FlashMode=qio,PSRAM=enabled,PartitionScheme=custom
+  ARDUINO_DIRECTORIES_DATA: ${{ github.workspace }}/build/arduino-data
+  ARDUINO_DIRECTORIES_DOWNLOADS: ${{ github.workspace }}/build/arduino-downloads
+  ARDUINO_DIRECTORIES_USER: ${{ github.workspace }}/build/arduino-user
+  ARDUINO_BOARD_MANAGER_ADDITIONAL_URLS: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure private OTA update URL
+        env:
+          OTA_UPDATE_JSON_URL: ${{ secrets.OTA_UPDATE_JSON_URL }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          from urllib.parse import urlsplit
+
+          url = os.environ.get("OTA_UPDATE_JSON_URL", "").strip()
+          if not url:
+              print("OTA_UPDATE_JSON_URL is not configured; keeping the source default.")
+              raise SystemExit(0)
+          try:
+              parsed = urlsplit(url)
+              valid = parsed.scheme == "https" and bool(parsed.hostname)
+          except ValueError:
+              valid = False
+          if not valid or any(ord(c) <= 32 or ord(c) == 127 for c in url):
+              raise SystemExit("OTA_UPDATE_JSON_URL must be a valid HTTPS URL without whitespace.")
+
+          path = Path("MYNOVA_RFC_V2/src/Pages/Settings/OTAPage.cpp")
+          source, count = re.subn(
+              r'^#define[ \t]+UPDATE_JSON_URL[ \t]+"[^"\r\n]*"[ \t]*$',
+              lambda _: "#define UPDATE_JSON_URL " + json.dumps(url),
+              path.read_text(encoding="utf-8"),
+              flags=re.MULTILINE,
+          )
+          if count != 1:
+              raise SystemExit("Expected exactly one UPDATE_JSON_URL definition in OTAPage.cpp.")
+          path.write_text(source, encoding="utf-8")
+          print("Configured the private OTA URL in the runner checkout only.")
+          PY
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: RFCWeb_V2/package-lock.json
+
+      - name: Build Web UI
+        working-directory: RFCWeb_V2
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - uses: arduino/setup-arduino-cli@v2
+        with:
+          version: '1.4.1'
+
+      - name: Install ESP32 core and pinned libraries
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install "esp32:esp32@${ESP32_CORE_VERSION}"
+          arduino-cli lib update-index
+          arduino-cli lib install --no-deps \
+            'U8g2@2.34.22' \
+            'IRremoteESP8266@2.9.0' \
+            'ArduinoJson@7.0.3' \
+            'ESP Async WebServer@3.9.2' \
+            'Async TCP@3.4.9' \
+            'PubSubClient@2.8.0' \
+            'ESP8266Audio@2.4.1' \
+            'arduinoFFT@2.0.4'
+
+      - name: Compile firmware with the sketch partition table
+        # The custom menu otherwise advertises a 16 MiB application limit.
+        # The real limit in our partitions.csv is 0x300000 (3 MiB).
+        run: |
+          arduino-cli compile \
+            --fqbn "$FQBN" \
+            --build-property upload.maximum_size=3145728 \
+            --build-path "$GITHUB_WORKSPACE/build/firmware" \
+            MYNOVA_RFC_V2
+
+      - name: Build LittleFS and merge the factory image
+        env:
+          BUILD_VERSION: ${{ github.ref_name }}
+        run: |
+          python3 scripts/package_firmware.py \
+            --arduino-data "$ARDUINO_DIRECTORIES_DATA" \
+            --core-version "$ESP32_CORE_VERSION" \
+            --version "$BUILD_VERSION"
+          cat build/release/RELEASE_NOTES.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload factory and Web OTA firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32s3-n8r2-firmware
+          path: build/release/
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: esp32s3-n8r2-firmware
+          path: release
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release/*.bin release/*.sha256 --clobber
+          else
+            gh release create "$RELEASE_TAG" release/*.bin release/*.sha256 \
+              --verify-tag --title "$RELEASE_TAG" --notes-file release/RELEASE_NOTES.md
+          fi
