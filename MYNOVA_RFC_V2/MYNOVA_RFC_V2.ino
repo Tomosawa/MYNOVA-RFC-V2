@@ -97,7 +97,7 @@ void setup()
     // 初始化Web服务 (55%)
     splashScreen.setProgress(55, "Web Service");
     webService.init(&wifiManager);
-    webService.serverStart();
+    webService.processRequest();
     if (!fastBoot) splashScreen.tick(50);
 
     // 初始化按键处理 (70%): 只建队列+注册中断, 分发由UIKernel轮询(不再建独立任务)
@@ -172,7 +172,7 @@ void loop()
     }
   }
 
-  // Web服务延迟启动轮询：开机时射频OFF推迟begin，开机后用户打开WiFi/AP时补启动
+  // 根据网络和监听状态同步 Web 服务，未能启动时稍后重试
   webService.processRequest();
 
   // 双堆水位周期上报(内部30秒节流)

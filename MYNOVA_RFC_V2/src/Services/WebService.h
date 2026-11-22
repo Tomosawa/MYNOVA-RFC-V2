@@ -20,8 +20,6 @@ class WebService
 public:
     WebService();
     void init(WiFiManager *wifiMgr);
-    void serverStart();
-    void serverStop();
     void processRequest();
 
     // WIFI相关接口
@@ -104,10 +102,9 @@ private:
     bool hasLastIrMeta;
     bool otaUpdateOK;            // OTA上传流程状态
 
-    bool serverRunning;          // server.begin() 是否已成功执行（防重复begin/崩溃）
-    bool pendingStart;           // 射频OFF时推迟启动，待STA/AP就绪后由processRequest补启动
     bool routesRegistered;       // 路由只注册一次，重启只调begin
 
+    void serverStart();
     bool ensureIrEdgesBuffer();  // 懒分配IR边沿副本缓冲(优先PSRAM)
 };
 

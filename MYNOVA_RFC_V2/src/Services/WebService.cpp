@@ -89,8 +89,6 @@ hasCapturedRf(false),
 lastIrEdges(nullptr),
 hasLastIrMeta(false),
 otaUpdateOK(false),
-serverRunning(false),
-pendingStart(false),
 routesRegistered(false)
 {
 }
@@ -103,37 +101,14 @@ void WebService::init(WiFiManager *wifiMgr)
 
 void WebService::serverStart()
 {
-    if (serverRunning) {
-        LOG_I("WebService: 服务器已在运行，跳过重复启动");
-        return;
-    }
-
-    // 无网卡不建站：WiFi/AP 全关时 WiFi.mode()==WIFI_OFF，
-    // 此时 AsyncWebServer::begin() 会在 AsyncTCP/lwIP 未就绪时触发
-    // xQueueSemaphoreTake 断言（queue.c:1709）直接崩溃。必须先挡掉。
-    SystemConfig sc = dataStore.LoadSystemConfig();
-    bool needNet = sc.WifiEnabled || sc.APEnabled;
-    if (!needNet) {
-        LOG_I("WebService: WiFi/AP均关闭，跳过HTTP服务器启动（零监听/零功耗）");
-        return;
-    }
-    if (WiFi.getMode() == WIFI_OFF) {
-        LOG_W("WebService: 射频仍为OFF，推迟HTTP服务器启动（等STA/AP就绪）");
-        pendingStart = true;
-        return;
-    }
-    LOG_I("WebService: 开始启动Web服务器");
-    
-    // 初始化LittleFS文件系统
+    if (!routesRegistered) {
     LOG_I("WebService: 挂载LittleFS文件系统");
-    if (!LittleFS.begin(false))
-    {
-        LOG_E("WebService: LittleFS挂载失败");
+    if (!LittleFS.begin(false)) {
+        LOG_E("WebService: LittleFS挂载失败，稍后重试");
         return;
     }
     LOG_I("WebService: LittleFS挂载成功");
 
-    if (!routesRegistered) {
     // 配置静态文件服务
     server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html").setFilter(
         [](AsyncWebServerRequest* request) {
@@ -225,46 +200,40 @@ void WebService::serverStart()
     server.on(AsyncURIMatcher("/api/ota/upload"), HTTP_POST,
               (ArRequestHandlerFunction)std::bind(&WebService::handleOTAUploadDoneRequest, this, std::placeholders::_1),
               (ArUploadHandlerFunction)std::bind(&WebService::handleOTAUploadRequest, this, std::placeholders::_1,std::placeholders::_2,std::placeholders::_3,std::placeholders::_4,std::placeholders::_5,std::placeholders::_6));
+    routesRegistered = true;
     } // routesRegistered
 
-    LOG_I("WebService: 启动HTTP服务器");
     server.begin();
-    serverRunning = true;
-    pendingStart = false;
-    routesRegistered = true;
-    LOG_I("WebService: Web服务器启动成功，监听端口80");
-}
-
-void WebService::serverStop()
-{
-    if (!serverRunning) return;
+    if (server.state() == LISTEN) {
+        LOG_I("WebService: HTTP服务器正在监听端口80");
+        return;
+    }
     server.end();
-    serverRunning = false;
-    LOG_I("WebService: HTTP服务器已停止");
+    LOG_W("WebService: HTTP端口80未能监听，稍后重试");
 }
 
 void WebService::processRequest()
 {
-    // 推迟启动补救：射频就绪（STA已连或AP已起）后自动把Web服务拉起；
-    // 用户在运行时打开WiFi/AP开关同样走这里，无需重启。
-    if (!serverRunning && pendingStart) {
-        bool netReady = (WiFi.status() == WL_CONNECTED) || (WiFi.getMode() & WIFI_AP);
-        if (netReady) {
-            LOG_I("WebService: 网络已就绪，补启动HTTP服务器");
-            pendingStart = false;
-            serverStart();
-        }
-    }
-    // 反向同步（节流1秒，避开NVS高频读）：运行时双开关全关 → 主动end释放监听
-    static unsigned long lastSync = 0;
-    if (serverRunning && millis() - lastSync > 1000) {
-        lastSync = millis();
-        SystemConfig sc = dataStore.LoadSystemConfig();
-        if (!sc.WifiEnabled && !sc.APEnabled) {
-            pendingStart = false;
-            LOG_I("WebService: 双开关已关闭，停止HTTP服务器");
-            serverStop();
-        }
+    constexpr uint32_t syncIntervalMs = 2000;
+    const uint32_t now = millis();
+    static uint32_t lastSync = now - syncIntervalMs;
+    if (now - lastSync < syncIntervalMs) return;
+    lastSync = now;
+
+    // STA 获得 IP 或 AP 启动后才建站，避免 lwIP 尚未就绪。
+    // 每次同步都检查实际监听状态，覆盖运行中开启网络及首次启动失败。
+    const SystemConfig config = systemSetting.getConfig();
+    const wifi_mode_t mode = WiFi.getMode();
+    const bool staReady = config.WifiEnabled && (mode & WIFI_STA) &&
+                          WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress();
+    const bool apReady = config.APEnabled && (mode & WIFI_AP) &&
+                         pWiFiManager && pWiFiManager->isAPStarted() && WiFi.softAPIP() != IPAddress();
+    const bool listening = server.state() == LISTEN;
+    if ((staReady || apReady) && !listening) {
+        serverStart();
+    } else if (listening && (mode == WIFI_OFF || (!config.WifiEnabled && !config.APEnabled))) {
+        server.end();
+        LOG_I("WebService: HTTP服务器已停止");
     }
 }
 
