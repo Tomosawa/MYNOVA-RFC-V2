@@ -28,6 +28,8 @@ struct OTAInfo {
 class OTAUpdater {
 public:
     OTAUpdater();
+    // Install the allocator once at startup, before network tasks are started.
+    static void configureTlsMemory();
     
     // Check for updates
     // Returns true if successful and populates info

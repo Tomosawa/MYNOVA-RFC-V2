@@ -8,12 +8,61 @@
 #include <HTTPClient.h>
 #include <Update.h>
 #include <WiFiClientSecure.h>
+#include <mbedtls/platform.h>
+#include <mbedtls/ssl.h>
+#include "../Util/HeapMonitor.h"
 #include "../Util/Log.h"
+#include "../Util/MemAlloc.h"
 
 #ifdef LOG_TAG
 #undef LOG_TAG
 #endif
 #define LOG_TAG "OTA"
+
+namespace {
+// The allocator hook is shared by mbedTLS. Only the task doing OTA gets
+// PSRAM-first allocations. Other tasks keep the core's internal RAM policy.
+thread_local bool otaTlsActive = false;
+
+class OtaTlsMemoryScope {
+public:
+    OtaTlsMemoryScope() : previous(otaTlsActive) { otaTlsActive = true; }
+    ~OtaTlsMemoryScope() { otaTlsActive = previous; }
+
+private:
+    const bool previous;
+};
+
+#if defined(CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC) && defined(MBEDTLS_PLATFORM_MEMORY) && !defined(MBEDTLS_PLATFORM_CALLOC_MACRO)
+void* tlsCalloc(size_t count, size_t size) {
+    if (otaTlsActive) {
+        if (void* ptr = psramCalloc(count, size)) {
+            return ptr;
+        }
+    }
+    return heap_caps_calloc(count, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+#endif
+
+void logTlsAllocationFailure() {
+    const HeapStat heap = HeapMonitor::getStats();
+    LOG_W("TLS allocation failed: internal RAM free=%u largest=%u, PSRAM free=%u largest=%u",
+          (unsigned)heap.ramFree, (unsigned)heap.ramMaxAlloc,
+          (unsigned)heap.psFree, (unsigned)heap.psMaxAlloc);
+}
+} // namespace
+
+void OTAUpdater::configureTlsMemory() {
+#if defined(CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC) && defined(MBEDTLS_PLATFORM_MEMORY) && !defined(MBEDTLS_PLATFORM_CALLOC_MACRO)
+    if (ESP.getPsramSize() > 0) {
+        if (mbedtls_platform_set_calloc_free(tlsCalloc, memFree) == 0) {
+            LOG_I("Online update TLS allocations prefer PSRAM");
+        } else {
+            LOG_W("Could not configure PSRAM for online update TLS");
+        }
+    }
+#endif
+}
 
 OTAUpdater::OTAUpdater() {
     lastError = "";
@@ -25,10 +74,13 @@ bool OTAUpdater::checkUpdate(String url, OTAInfo& info) {
         return false;
     }
 
-    HTTPClient http;
+    const OtaTlsMemoryScope tlsMemory;
     WiFiClientSecure client;
+    HTTPClient http;
     client.setInsecure(); // 忽略SSL证书验证，简化操作
-    client.setTimeout(10000); // 增加超时时间到10秒
+    client.setHandshakeTimeout(10); // 秒
+    http.setConnectTimeout(5000);  // 毫秒
+    http.setTimeout(10000);        // 毫秒
     
     LOG_I("Checking update from: %s", url.c_str());
 
@@ -37,16 +89,33 @@ bool OTAUpdater::checkUpdate(String url, OTAInfo& info) {
     
     if (!http.begin(client, url)) {
         lastError = "连接初始化失败";
+        LOG_W("Update manifest URL rejected by HTTP client");
         return false;
     }
     
+    const unsigned long requestStarted = millis();
     int httpCode = http.GET();
     if (httpCode != HTTP_CODE_OK) {
-        lastError = "HTTP错误: " + String(httpCode) + " (" + http.errorToString(httpCode) + ")";
+        if (httpCode < 0) {
+            lastError = "更新请求失败 (" + String(httpCode) + ")";
+            char detail[128] = {};
+            int clientError = client.lastError(detail, sizeof(detail));
+            LOG_W("Update manifest GET failed after %lu ms (%d: %s), secure client error %d: %s",
+                  millis() - requestStarted, httpCode, http.errorToString(httpCode).c_str(), clientError,
+                  clientError < 0 ? detail : "no additional error reported");
+            if (clientError == MBEDTLS_ERR_SSL_ALLOC_FAILED) {
+                lastError = "TLS内存不足";
+                logTlsAllocationFailure();
+            }
+        } else {
+            lastError = "HTTP错误: " + String(httpCode);
+            LOG_W("Update manifest server returned HTTP %d", httpCode);
+        }
         http.end();
         return false;
     }
     
+    LOG_I("Update manifest returned HTTP 200, reading response");
     String payload = http.getString();
     http.end();
     
@@ -92,8 +161,9 @@ bool OTAUpdater::performUpdate(String url, size_t size, int type, ProgressCallba
         return false;
     }
     
-    HTTPClient http;
+    const OtaTlsMemoryScope tlsMemory;
     WiFiClientSecure client;
+    HTTPClient http;
     client.setInsecure();
     client.setTimeout(10000); // 设置超时 10s
     
@@ -110,6 +180,16 @@ bool OTAUpdater::performUpdate(String url, size_t size, int type, ProgressCallba
     int httpCode = http.GET();
     if (httpCode != HTTP_CODE_OK) {
         lastError = "HTTP错误: " + String(httpCode);
+        if (httpCode < 0) {
+            char detail[128] = {};
+            int clientError = client.lastError(detail, sizeof(detail));
+            LOG_W("Update download GET failed (%d), secure client error %d: %s",
+                  httpCode, clientError, clientError < 0 ? detail : "no additional error reported");
+            if (clientError == MBEDTLS_ERR_SSL_ALLOC_FAILED) {
+                lastError = "TLS内存不足";
+                logTlsAllocationFailure();
+            }
+        }
         http.end();
         return false;
     }

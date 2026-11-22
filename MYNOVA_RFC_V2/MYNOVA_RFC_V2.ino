@@ -20,6 +20,7 @@
 #include "src/Services/WiFiManager.h"
 #include "src/Services/DataStore.h"
 #include "src/Services/BackupManager.h"
+#include "src/Services/OTAUpdater.h"
 #include "src/Drivers/SplashScreen.h"
 #include "src/Services/HAManager.h"
 #include "src/Drivers/AudioPlayer.h"
@@ -52,6 +53,7 @@ void setup()
 
     // 分级日志系统: 从NVS恢复级别, 必须最先就绪(后续模块日志才能被过滤/输出)
     Log::begin();
+    OTAUpdater::configureTlsMemory();
 
     // 版本信息
     String version_info = "MYNOVA RFC Firmware V" + String(FIRMWARE_VERSION) + " \r\nBuild " + String(FIRMWARE_BUILD_DATE);
